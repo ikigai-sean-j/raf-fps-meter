@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>RAF FPS Meter</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;800&display=swap">
+<style>
+  /* Layout: one column, big live number on top, frame-time trace, stat grid, device info. */
+  :root {
+    --bg: #f3f5f4;
+    --surface: #ffffff;
+    --fg: #14201b;
+    --muted: #5d6b65;
+    --line: #d7dedb;
+    --accent: #0f8a5f;
+    --warn: #c27c0e;
+    --bad: #c23b2e;
+    --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0d1311; --surface: #151d1a; --fg: #e4ece8; --muted: #8a9a93;
+      --line: #26322d; --accent: #3ccf94; --warn: #e3a63c; --bad: #ef6a5c;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0d1311; --surface: #151d1a; --fg: #e4ece8; --muted: #8a9a93;
+    --line: #26322d; --accent: #3ccf94; --warn: #e3a63c; --bad: #ef6a5c;
+    color-scheme: dark;
+  }
+  body { margin: 0;
+    background: var(--bg); color: var(--fg);
+    font-family: var(--mono); font-variant-numeric: tabular-nums;
+    padding-inline: 16px; padding-block: 16px 32px;
+  }
+  main { max-width: 560px; margin: 0 auto; display: grid; gap: 16px; }
+  .hero { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  .big { font-size: clamp(64px, 24vw, 128px); font-weight: 800; line-height: 1; letter-spacing: -0.04em; color: var(--accent); }
+  .big small { font-size: 0.22em; font-weight: 600; color: var(--muted); letter-spacing: 0.08em; margin-left: 6px; }
+  .cap { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
+  .pill { font-size: 13px; font-weight: 600; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--surface); }
+  canvas { width: 100%; height: 160px; display: block; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .stats div { background: var(--surface); padding: 10px 12px; display: grid; gap: 2px; min-width: 0; }
+  .stats b { font-size: 20px; font-weight: 600; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  button {
+    font: inherit; font-size: 14px; font-weight: 600; padding: 10px 14px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--surface); color: var(--fg); cursor: pointer;
+  }
+  button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-size: 12px; }
+  dt { color: var(--muted); }
+  dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+  .legend { display: flex; gap: 12px; flex-wrap: wrap; font-size: 11px; color: var(--muted); }
+  .legend span::before { content: ""; display: inline-block; width: 10px; height: 2px; margin-right: 4px; vertical-align: middle; background: currentColor; }
+</style>
+</head>
+<body>
+
+<main>
+  <div class="hero">
+    <div class="big"><span id="fps">--</span><small>FPS</small></div>
+    <span class="pill" id="cap">detecting cap…</span>
+  </div>
+
+  <div>
+    <canvas id="graph" aria-label="Frame time trace, last 240 frames"></canvas>
+    <div class="legend" style="margin-top:6px">
+      <span style="color:var(--muted)">guides: 8.3 / 16.7 / 33.3 ms</span>
+      <span style="color:var(--bad)">bar &gt; 1.5× median = dropped</span>
+    </div>
+  </div>
+
+  <div class="stats">
+    <div><span class="cap">Avg FPS</span><b id="avg">--</b></div>
+    <div><span class="cap">1% low</span><b id="low">--</b></div>
+    <div><span class="cap">Max FPS</span><b id="max">--</b></div>
+    <div><span class="cap">Frame ms</span><b id="ms">--</b></div>
+    <div><span class="cap">Median ms</span><b id="med">--</b></div>
+    <div><span class="cap">Dropped</span><b id="drop">0</b></div>
+  </div>
+
+  <div class="row">
+    <button id="reset">Reset stats</button>
+    <button id="load" aria-pressed="false">Add CPU load</button>
+    <button id="wake" aria-pressed="false">Keep screen on</button>
+  </div>
+
+  <dl id="info"></dl>
+</main>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const N = 240;                    // frames in the trace
+  const deltas = new Float32Array(N);
+  let head = 0, filled = 0;
+  let last = 0, frames = 0, windowStart = 0;
+  let all = [];                     // per-frame deltas since reset (capped)
+  let maxFps = 0, dropped = 0, runtime = 0;
+  let loadOn = false;
+
+  const canvas = $("graph"), ctx = canvas.getContext("2d");
+  function size() {
+    const dpr = window.devicePixelRatio || 1;
+    const r = canvas.getBoundingClientRect();
+    canvas.width = Math.round(r.width * dpr);
+    canvas.height = Math.round(r.height * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  size(); addEventListener("resize", size);
+
+  const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+  function median(arr) {
+    if (!arr.length) return 0;
+    const s = Array.from(arr).sort((a, b) => a - b);
+    return s[s.length >> 1];
+  }
+
+  // Snap a measured frame interval to a common display refresh rate.
+  function capLabel(medMs) {
+    if (!medMs) return "detecting cap…";
+    const hz = 1000 / medMs;
+    const common = [24, 30, 40, 45, 48, 50, 60, 72, 75, 90, 100, 120, 144, 165, 240];
+    const near = common.reduce((a, b) => Math.abs(b - hz) < Math.abs(a - hz) ? b : a);
+    return Math.abs(near - hz) < 2.5 ? `capped ≈ ${near} Hz` : `≈ ${hz.toFixed(1)} Hz`;
+  }
+
+  function draw(med) {
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    const maxMs = 50;
+    const y = ms => h - Math.min(ms, maxMs) / maxMs * (h - 4);
+    ctx.clearRect(0, 0, w, h);
+    ctx.font = "10px " + css("--mono");
+    ctx.lineWidth = 1;
+    for (const g of [8.33, 16.67, 33.33]) {
+      ctx.strokeStyle = css("--line"); ctx.beginPath();
+      ctx.moveTo(0, y(g) + 0.5); ctx.lineTo(w, y(g) + 0.5); ctx.stroke();
+      ctx.fillStyle = css("--muted"); ctx.fillText(g.toFixed(1), 4, y(g) - 3);
+    }
+    const bw = w / N, ok = css("--accent"), bad = css("--bad");
+    for (let i = 0; i < filled; i++) {
+      const d = deltas[(head - filled + i + N) % N];
+      ctx.fillStyle = med && d > med * 1.5 ? bad : ok;
+      const top = y(d);
+      ctx.fillRect(w - (filled - i) * bw, top, Math.max(1, bw - 0.5), h - top);
+    }
+  }
+
+  function tick(t) {
+    if (last) {
+      const d = t - last;
+      // Skip huge gaps (tab hidden / app backgrounded) so stats stay meaningful.
+      if (d < 1000) {
+        deltas[head] = d; head = (head + 1) % N; filled = Math.min(filled + 1, N);
+        all.push(d); if (all.length > 20000) all.shift();
+        runtime += d;
+      }
+    } else {
+      windowStart = t;
+    }
+    last = t;
+    frames++;
+
+    if (loadOn) { const e = performance.now() + 12; while (performance.now() < e) {} }
+
+    if (t - windowStart >= 500) {
+      const fps = frames * 1000 / (t - windowStart);
+      frames = 0; windowStart = t;
+      const recent = deltas.slice(0, filled);
+      const med = median(recent);
+      if (all.length > 30) maxFps = Math.max(maxFps, fps);
+      dropped = med ? all.filter(d => d > med * 1.5).length : 0;
+      const sorted = all.slice().sort((a, b) => b - a);
+      const p99 = sorted[Math.floor(sorted.length * 0.01)] || 0;
+
+      $("fps").textContent = Math.round(fps);
+      $("avg").textContent = runtime ? (all.length * 1000 / runtime).toFixed(1) : "--";
+      $("low").textContent = p99 ? (1000 / p99).toFixed(1) : "--";
+      $("max").textContent = maxFps ? maxFps.toFixed(1) : "--";
+      $("ms").textContent = deltas[(head - 1 + N) % N].toFixed(2);
+      $("med").textContent = med.toFixed(2);
+      $("drop").textContent = dropped;
+      $("cap").textContent = capLabel(med);
+    }
+    draw(median(deltas.slice(0, filled)));
+    requestAnimationFrame(tick);
+  }
+
+  document.addEventListener("visibilitychange", () => { last = 0; frames = 0; });
+
+  $("reset").onclick = () => {
+    all = []; maxFps = 0; dropped = 0; runtime = 0; filled = 0; head = 0; last = 0; frames = 0;
+    $("drop").textContent = 0;
+  };
+  $("load").onclick = e => {
+    loadOn = !loadOn; e.currentTarget.setAttribute("aria-pressed", loadOn);
+    e.currentTarget.textContent = loadOn ? "CPU load: 12 ms/frame" : "Add CPU load";
+  };
+  let lock = null;
+  $("wake").onclick = async e => {
+    const btn = e.currentTarget;
+    try {
+      if (lock) { await lock.release(); lock = null; btn.setAttribute("aria-pressed", "false"); btn.textContent = "Keep screen on"; return; }
+      lock = await navigator.wakeLock.request("screen");
+      btn.setAttribute("aria-pressed", "true"); btn.textContent = "Screen kept on";
+      lock.addEventListener("release", () => { lock = null; btn.setAttribute("aria-pressed", "false"); btn.textContent = "Keep screen on"; });
+    } catch { btn.textContent = "Wake lock unavailable"; }
+  };
+
+  const info = {
+    "Viewport": `${innerWidth}×${innerHeight} @ ${devicePixelRatio}x`,
+    "Screen": `${screen.width}×${screen.height}`,
+    "Low power hint": matchMedia("(prefers-reduced-motion: reduce)").matches ? "reduced motion on" : "reduced motion off",
+    "User agent": navigator.userAgent,
+  };
+  $("info").innerHTML = Object.entries(info).map(([k, v]) => `<dt>${k}</dt><dd>${v.replace(/</g, "&lt;")}</dd>`).join("");
+
+  requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
